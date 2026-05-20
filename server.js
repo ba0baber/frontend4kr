@@ -1,134 +1,312 @@
 require('dotenv').config();
 const express = require('express');
-const { Pool } = require('pg');
-const mongoose = require('mongoose');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { createClient } = require('redis');
 
 const app = express();
 app.use(express.json());
 
-// ==================== PostgreSQL ====================
+const PORT = process.env.PORT || 3021;
 
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  database: process.env.DB_NAME,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
+const ACCESS_SECRET = process.env.ACCESS_SECRET || 'access_secret';
+const REFRESH_SECRET = process.env.REFRESH_SECRET || 'refresh_secret';
+const ACCESS_EXPIRES_IN = '15m';
+const REFRESH_EXPIRES_IN = '7d';
+
+const USERS_CACHE_TTL = 60;
+const PRODUCTS_CACHE_TTL = 600;
+
+// { id, username, passwordHash, role, blocked }
+const users = [];
+// { id, name, price, description }
+const products = [];
+const refreshTokens = new Set();
+
+// ==================== Redis ====================
+
+const redisClient = createClient({
+  url: process.env.REDIS_URL || 'redis://127.0.0.1:6379',
 });
 
-pool.query(`
-  CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,
-    first_name VARCHAR(100) NOT NULL,
-    last_name VARCHAR(100) NOT NULL,
-    age INTEGER NOT NULL,
-    created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
-    updated_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
-  )
-`).then(() => console.log('PostgreSQL table ready'));
+redisClient.on('error', (err) => {
+  console.error('Redis error:', err);
+});
 
-app.post('/api/pg/users', async (req, res) => {
-  const { first_name, last_name, age } = req.body;
-  const result = await pool.query(
-    `INSERT INTO users (first_name, last_name, age)
-     VALUES ($1, $2, $3)
-     RETURNING *`,
-    [first_name, last_name, age]
+async function initRedis() {
+  try {
+    await redisClient.connect();
+    console.log('Redis connected');
+  } catch (err) {
+    console.error('Redis connection failed:', err.message);
+  }
+}
+
+function cacheMiddleware(keyBuilder, ttl) {
+  return async (req, res, next) => {
+    try {
+      const key = keyBuilder(req);
+      const cached = await redisClient.get(key);
+      if (cached) {
+        return res.json({ source: 'cache', data: JSON.parse(cached) });
+      }
+      req.cacheKey = key;
+      req.cacheTTL = ttl;
+      next();
+    } catch (err) {
+      console.error('Cache read error:', err);
+      next();
+    }
+  };
+}
+
+async function saveToCache(key, data, ttl) {
+  try {
+    await redisClient.set(key, JSON.stringify(data), { EX: ttl });
+  } catch (err) {
+    console.error('Cache save error:', err);
+  }
+}
+
+async function invalidateUsersCache(userId = null) {
+  try {
+    await redisClient.del('users:all');
+    if (userId) await redisClient.del(`users:${userId}`);
+  } catch (err) {
+    console.error('Users cache invalidate error:', err);
+  }
+}
+
+async function invalidateProductsCache(productId = null) {
+  try {
+    await redisClient.del('products:all');
+    if (productId) await redisClient.del(`products:${productId}`);
+  } catch (err) {
+    console.error('Products cache invalidate error:', err);
+  }
+}
+
+// ==================== Auth helpers ====================
+
+function generateAccessToken(user) {
+  return jwt.sign(
+    { sub: user.id, username: user.username, role: user.role },
+    ACCESS_SECRET,
+    { expiresIn: ACCESS_EXPIRES_IN }
   );
-  res.status(201).json(result.rows[0]);
-});
+}
 
-app.get('/api/pg/users', async (req, res) => {
-  const result = await pool.query('SELECT * FROM users ORDER BY id');
-  res.json(result.rows);
-});
-
-app.get('/api/pg/users/:id', async (req, res) => {
-  const result = await pool.query(
-    'SELECT * FROM users WHERE id = $1',
-    [req.params.id]
+function generateRefreshToken(user) {
+  return jwt.sign(
+    { sub: user.id, username: user.username, role: user.role },
+    REFRESH_SECRET,
+    { expiresIn: REFRESH_EXPIRES_IN }
   );
-  if (result.rows.length === 0) return res.status(404).json({ message: 'User not found' });
-  res.json(result.rows[0]);
+}
+
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization || '';
+  const [scheme, token] = header.split(' ');
+  if (scheme !== 'Bearer' || !token) {
+    return res.status(401).json({ error: 'Missing or invalid Authorization header' });
+  }
+  try {
+    const payload = jwt.verify(token, ACCESS_SECRET);
+    const user = users.find((u) => u.id === payload.sub);
+    if (!user || user.blocked) {
+      return res.status(401).json({ error: 'User not found or blocked' });
+    }
+    req.user = payload;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+function roleMiddleware(allowedRoles) {
+  return (req, res, next) => {
+    if (!req.user || !allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    next();
+  };
+}
+
+// ==================== AUTH routes ====================
+
+app.post('/api/auth/register', async (req, res) => {
+  const { username, password, role } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'username and password are required' });
+  }
+  if (users.some((u) => u.username === username)) {
+    return res.status(409).json({ error: 'username already exists' });
+  }
+  const passwordHash = await bcrypt.hash(password, 10);
+  const user = {
+    id: String(users.length + 1),
+    username,
+    passwordHash,
+    role: role || 'user',
+    blocked: false,
+  };
+  users.push(user);
+  res.status(201).json({ id: user.id, username: user.username, role: user.role, blocked: user.blocked });
 });
 
-app.patch('/api/pg/users/:id', async (req, res) => {
-  const { first_name, last_name, age } = req.body;
-  const now = Math.floor(Date.now() / 1000);
-  const result = await pool.query(
-    `UPDATE users
-     SET first_name = COALESCE($1, first_name),
-         last_name  = COALESCE($2, last_name),
-         age        = COALESCE($3, age),
-         updated_at = $4
-     WHERE id = $5
-     RETURNING *`,
-    [first_name, last_name, age, now, req.params.id]
-  );
-  if (result.rows.length === 0) return res.status(404).json({ message: 'User not found' });
-  res.json(result.rows[0]);
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'username and password are required' });
+  }
+  const user = users.find((u) => u.username === username);
+  if (!user || user.blocked) {
+    return res.status(401).json({ error: 'Invalid credentials or user is blocked' });
+  }
+  const isValid = await bcrypt.compare(password, user.passwordHash);
+  if (!isValid) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  const accessToken = generateAccessToken(user);
+  const refreshToken = generateRefreshToken(user);
+  refreshTokens.add(refreshToken);
+  res.json({ accessToken, refreshToken });
 });
 
-app.delete('/api/pg/users/:id', async (req, res) => {
-  const result = await pool.query(
-    'DELETE FROM users WHERE id = $1 RETURNING *',
-    [req.params.id]
-  );
-  if (result.rows.length === 0) return res.status(404).json({ message: 'User not found' });
-  res.json({ message: 'User deleted' });
+app.post('/api/auth/refresh', (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) {
+    return res.status(400).json({ error: 'refreshToken is required' });
+  }
+  if (!refreshTokens.has(refreshToken)) {
+    return res.status(401).json({ error: 'Invalid refresh token' });
+  }
+  try {
+    const payload = jwt.verify(refreshToken, REFRESH_SECRET);
+    const user = users.find((u) => u.id === payload.sub);
+    if (!user || user.blocked) {
+      return res.status(401).json({ error: 'User not found or blocked' });
+    }
+    refreshTokens.delete(refreshToken);
+    const newAccessToken = generateAccessToken(user);
+    const newRefreshToken = generateRefreshToken(user);
+    refreshTokens.add(newRefreshToken);
+    res.json({ accessToken: newAccessToken, refreshToken: newRefreshToken });
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
+  }
 });
 
-// ==================== MongoDB ====================
-
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
-
-const userSchema = new mongoose.Schema({
-  first_name: { type: String, required: true },
-  last_name:  { type: String, required: true },
-  age:        { type: Number, required: true },
-  created_at: { type: Number, default: () => Math.floor(Date.now() / 1000) },
-  updated_at: { type: Number, default: () => Math.floor(Date.now() / 1000) },
+app.get('/api/auth/me', authMiddleware, roleMiddleware(['user', 'seller', 'admin']), (req, res) => {
+  const user = users.find((u) => u.id === req.user.sub);
+  res.json({ id: user.id, username: user.username, role: user.role, blocked: user.blocked });
 });
 
-const MongoUser = mongoose.model('User', userSchema);
+// ==================== USERS routes ====================
 
-app.post('/api/mongo/users', async (req, res) => {
-  const user = new MongoUser(req.body);
-  await user.save();
-  res.status(201).json(user);
+app.get(
+  '/api/users',
+  authMiddleware,
+  roleMiddleware(['admin']),
+  cacheMiddleware(() => 'users:all', USERS_CACHE_TTL),
+  async (req, res) => {
+    const data = users.map((u) => ({ id: u.id, username: u.username, role: u.role, blocked: u.blocked }));
+    await saveToCache(req.cacheKey, data, req.cacheTTL);
+    res.json({ source: 'server', data });
+  }
+);
+
+app.get(
+  '/api/users/:id',
+  authMiddleware,
+  roleMiddleware(['admin']),
+  cacheMiddleware((req) => `users:${req.params.id}`, USERS_CACHE_TTL),
+  async (req, res) => {
+    const user = users.find((u) => u.id === req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const data = { id: user.id, username: user.username, role: user.role, blocked: user.blocked };
+    await saveToCache(req.cacheKey, data, req.cacheTTL);
+    res.json({ source: 'server', data });
+  }
+);
+
+app.put('/api/users/:id', authMiddleware, roleMiddleware(['admin']), async (req, res) => {
+  const { username, role, blocked } = req.body;
+  const user = users.find((u) => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (username !== undefined) user.username = username;
+  if (role !== undefined) user.role = role;
+  if (blocked !== undefined) user.blocked = blocked;
+  await invalidateUsersCache(user.id);
+  res.json({ id: user.id, username: user.username, role: user.role, blocked: user.blocked });
 });
 
-app.get('/api/mongo/users', async (req, res) => {
-  const users = await MongoUser.find();
-  res.json(users);
+app.delete('/api/users/:id', authMiddleware, roleMiddleware(['admin']), async (req, res) => {
+  const user = users.find((u) => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  user.blocked = true;
+  await invalidateUsersCache(user.id);
+  res.json({ message: 'User blocked', id: user.id });
 });
 
-app.get('/api/mongo/users/:id', async (req, res) => {
-  const user = await MongoUser.findById(req.params.id);
-  if (!user) return res.status(404).json({ message: 'User not found' });
-  res.json(user);
+// ==================== PRODUCTS routes ====================
+
+app.post('/api/products', authMiddleware, roleMiddleware(['seller', 'admin']), async (req, res) => {
+  const { name, price, description } = req.body;
+  if (!name || price === undefined) {
+    return res.status(400).json({ error: 'name and price are required' });
+  }
+  const product = { id: String(products.length + 1), name, price, description: description || '' };
+  products.push(product);
+  await invalidateProductsCache();
+  res.status(201).json(product);
 });
 
-app.patch('/api/mongo/users/:id', async (req, res) => {
-  const updates = { ...req.body, updated_at: Math.floor(Date.now() / 1000) };
-  const user = await MongoUser.findByIdAndUpdate(
-    req.params.id,
-    updates,
-    { new: true }
-  );
-  if (!user) return res.status(404).json({ message: 'User not found' });
-  res.json(user);
+app.get(
+  '/api/products',
+  authMiddleware,
+  roleMiddleware(['user', 'seller', 'admin']),
+  cacheMiddleware(() => 'products:all', PRODUCTS_CACHE_TTL),
+  async (req, res) => {
+    await saveToCache(req.cacheKey, products, req.cacheTTL);
+    res.json({ source: 'server', data: products });
+  }
+);
+
+app.get(
+  '/api/products/:id',
+  authMiddleware,
+  roleMiddleware(['user', 'seller', 'admin']),
+  cacheMiddleware((req) => `products:${req.params.id}`, PRODUCTS_CACHE_TTL),
+  async (req, res) => {
+    const product = products.find((p) => p.id === req.params.id);
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+    await saveToCache(req.cacheKey, product, req.cacheTTL);
+    res.json({ source: 'server', data: product });
+  }
+);
+
+app.put('/api/products/:id', authMiddleware, roleMiddleware(['seller', 'admin']), async (req, res) => {
+  const { name, price, description } = req.body;
+  const product = products.find((p) => p.id === req.params.id);
+  if (!product) return res.status(404).json({ error: 'Product not found' });
+  if (name !== undefined) product.name = name;
+  if (price !== undefined) product.price = price;
+  if (description !== undefined) product.description = description;
+  await invalidateProductsCache(product.id);
+  res.json(product);
 });
 
-app.delete('/api/mongo/users/:id', async (req, res) => {
-  const user = await MongoUser.findByIdAndDelete(req.params.id);
-  if (!user) return res.status(404).json({ message: 'User not found' });
-  res.json({ message: 'User deleted' });
+app.delete('/api/products/:id', authMiddleware, roleMiddleware(['admin']), async (req, res) => {
+  const index = products.findIndex((p) => p.id === req.params.id);
+  if (index === -1) return res.status(404).json({ error: 'Product not found' });
+  const [deleted] = products.splice(index, 1);
+  await invalidateProductsCache(deleted.id);
+  res.json({ message: 'Product deleted' });
 });
 
 // ==================== Start ====================
 
-const PORT = process.env.PORT || 3020;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+initRedis().then(() => {
+  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+});
