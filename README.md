@@ -1,10 +1,12 @@
 # Контрольная работа №4 — Фронтенд и бэкенд разработка
 
-## Выполненные практические работы: №20 MongoDB  | №21 Redis кэширование  | №22 Балансировка нагрузки | №23 Docker 
+## Выполненные практические работы: №19 PostgreSQL ✅ | №20 MongoDB ✅ | №21 Redis кэширование ✅ | №22 Балансировка нагрузки ✅ | №23 Docker ✅
 
 ## Что выполнено в каждой практической
 
-№20 MongoDB: создано API с подключением к MongoDB, реализованы CRUD операции (POST, GET, GET/:id, PATCH, DELETE) для пользователей с полями first_name, last_name, age, created_at, updated_at (unix timestamp).
+№19 PostgreSQL: создано API с подключением к PostgreSQL, реализованы CRUD операции (POST, GET, GET/:id, PATCH, DELETE) для пользователей с полями first_name, last_name, age, created_at, updated_at (unix timestamp). Использован модуль pg для работы с базой данных.
+
+№20 MongoDB: создано API с подключением к MongoDB, реализованы CRUD операции (POST, GET, GET/:id, PATCH, DELETE) для пользователей с полями first_name, last_name, age, created_at, updated_at (unix timestamp). Использован Mongoose ODM.
 
 №21 Redis кэширование: добавлено кэширование GET /api/users (TTL 1 мин), GET /api/users/:id (TTL 1 мин), GET /api/products (TTL 10 мин), GET /api/products/:id (TTL 10 мин). Инвалидация кэша при изменении данных. Ответ помечается source: cache или source: server.
 
@@ -13,6 +15,11 @@
 №23 Docker контейнеризация: создан Dockerfile для backend-сервиса, docker-compose.yml с 3 бэкендами, Redis, Nginx-балансировщиком. Все сервисы объединены в сеть. Запуск через docker compose up --build. Проверена балансировка и отказоустойчивость.
 
 ## Как проверить
+
+### №19 PostgreSQL
+Запуск: npm install && node server.js
+Проверка: curl -X POST http://localhost:3000/api/users -H "Content-Type: application/json" -d '{"first_name":"Иван","last_name":"Петров","age":25}' && curl http://localhost:3000/api/users
+Ожидаемый результат: JSON с данными пользователя, поля created_at и updated_at в unix timestamp.
 
 ### №20 MongoDB
 Запуск: npm install && node server.js
@@ -38,7 +45,7 @@
 Остановка: docker compose down
 
 ## Технологии
-Node.js, Express, MongoDB, Mongoose, Redis, Nginx, HAProxy, Docker, Docker Compose, JWT
+Node.js, Express, PostgreSQL, MongoDB, Mongoose, Redis, Nginx, HAProxy, Docker, Docker Compose, JWT
 
 ## Ссылка на репозиторий
 https://github.com/ba0baber/frontend4kr
