@@ -308,5 +308,9 @@ app.delete('/api/products/:id', authMiddleware, roleMiddleware(['admin']), async
 // ==================== Start ====================
 
 initRedis().then(() => {
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", port: process.env.PORT || 3021 });
+});
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 });
